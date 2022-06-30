@@ -21,6 +21,7 @@ use Modern::Perl;
 
 use Mojolicious::Lite;
 use Mojo::UserAgent;
+use Mojo::Promise;
 
 
 my @sites = ();
@@ -99,7 +100,9 @@ websocket '/answer' => sub {
     # Не использовал Mojo::DOM чтобы не сильно усложнять или увеличивать код. В поиске счетчика аналогично.
     @sites = $content =~ m/<aclass="spritelinkouttopRankingGrid-blankLink"[^>]+?href=["']?([^'">]+?)['"].*?>/sig;
 
-    my @promises = map get_url_data($c), 1 .. scalar @sites;
+    my @promises;
+    push @promises, get_url_data($c) for 1 .. scalar @sites;
+
     Mojo::Promise->all(@promises)->wait if @promises;
 };
 
