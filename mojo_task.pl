@@ -22,32 +22,10 @@ use Modern::Perl;
 use Mojolicious::Lite;
 use Mojo::UserAgent;
 
-# Страницу с рейтингом предварительно сохранили в html, т.к. на самом сайте стоят защиты от ботов
-# Теоретически защиту можно обойти, если использовать javascript webbrowser PhantomJS, который можно замаскировать почти под настоящего пользователя.
-# Однако при первом входе попросили ввести captcha.
-# Поэтому здесь представлен мой способ получить перечень доменов из рейтинга, как если бы я мог получить эту страницу путем простого $ua->get()
-open(my $F, '<', 'similarweb.html');
-
-my $content = '';
-
-while (<$F>) {
-    $content .= $_;
-}
-
-close ($F);
-
-# избавляемся от пробелов и переносов строк.
-$content =~ s/\s+//g;
 
 my @sites = ();
-# Получаем список доменов из рейтинга, ссылки на домены имеют уникальный набор классов, поэтому по ним можно определить какие именно ссылки нам нужны со всей страницы
-# минусом такого подхода будет то, что при изменении ссылок на странице - паттерн перестанет работать
-# Не использовал Mojo::DOM чтобы не сильно усложнять или увеличивать код. В поиске счетчика аналогично.
-@sites = $content =~ m/<aclass="spritelinkouttopRankingGrid-blankLink"[^>]+?href=["']?([^'">]+?)['"].*?>/sig;
-
-my $result;
-
 my $ua = Mojo::UserAgent->new;
+
 $ua->max_redirects(3);
 $ua->connect_timeout(20);
 $ua->request_timeout(20);
@@ -71,37 +49,58 @@ sub get_counter {
     return \%answer;
 }
 
+# Функция получения кода страницы
+sub get_url_data {
+    my $c = shift;
+    return unless my $url = shift @sites;
+
+    $ua->get_p($url)->then(sub {
+        my ($tx) = @_;
+
+        $c->send({ json => { 'url' => $url, 'data' => get_counter($tx->result->body) } });
+        get_url_data($c);
+    })->catch(sub {
+        my ($err) = @_;
+        # некоторые сайты недоступны из РФ, некоторые очень далеко территориально и загружаются долго
+        # в таких случаях отправляем не информацию о счетчиках, а проблему по которой не получили информацию.
+        # если ничего не отправлять – на сайте будут отображаться только успешные вызовы get_p
+        $c->send({ json => { 'url' => $url, 'data' => $err } });
+    });
+}
+
 any '/' => 'index';
 
 websocket '/answer' => sub {
     my $c = shift;
 
+    $c->inactivity_timeout(10);
+
     # Максимально быстро даём какой-то ответ по websocket, чтобы скорее получить первые данные (дать ответ code=101) и загрузка страницы была быстрее.
     $c->send({ json => { 'start' => 1 } });
 
-    # Увеличил лимит открытого соединения без событий, чтобы не закрылось раньше времени.
-    $c->inactivity_timeout(300);
+    # Страницу с рейтингом предварительно сохранили в html, т.к. на самом сайте стоят защиты от ботов
+    # Теоретически защиту можно обойти, если использовать javascript webbrowser PhantomJS, который можно замаскировать почти под настоящего пользователя.
+    # Однако при первом входе попросили ввести captcha.
+    # Поэтому здесь представлен мой способ получить перечень доменов из рейтинга, как если бы я мог получить эту страницу путем простого $ua->get()
+    open(my $F, '<', 'similarweb.html');
 
-    my $tx = $c->render_later->tx;
+    my $content = '';
 
-    foreach my $site (@sites) {
-        $ua->get_p($site)->then(sub {
-            my ($tx) = @_;
-
-            $c->send({ json => { 'url' => $site, 'data' => get_counter($tx->result->body) } });
-
-        })->catch(sub {
-            my ($err) = @_;
-            # подсмотрел в документации, что это надо прописать, чтобы $tx не закрылось раньше времени.
-            # без этого получение ответов от ws прерывалось в рандомный момент.
-            $tx;
-
-            # некоторые сайты недоступны из РФ, некоторые очень далеко территориально и загружаются долго
-            # в таких случаях отправляем не информацию о счетчиках, а проблему по которой не получили информацию.
-            # если ничего не отправлять – на сайте будут отображаться только успешные вызовы get_p
-            $c->send({ json => { 'url' => $site, 'data' => $err } });
-        });
+    while (<$F>) {
+        $content .= $_;
     }
+
+    close ($F);
+
+    $content =~ s/\s+//g;
+
+    # Получаем список доменов из рейтинга, ссылки на домены имеют уникальный набор классов, поэтому по ним можно определить какие именно ссылки нам нужны со всей страницы
+    # минусом такого подхода будет то, что при изменении ссылок на странице - паттерн перестанет работать
+    # Не использовал Mojo::DOM чтобы не сильно усложнять или увеличивать код. В поиске счетчика аналогично.
+    @sites = $content =~ m/<aclass="spritelinkouttopRankingGrid-blankLink"[^>]+?href=["']?([^'">]+?)['"].*?>/sig;
+
+    my @promises = map get_url_data($c), 1 .. scalar @sites;
+    Mojo::Promise->all(@promises)->wait if @promises;
 };
 
 app->start;
@@ -117,22 +116,24 @@ __DATA__
     <script src="//ajax.googleapis.com/ajax/libs/jquery/1.10.1/jquery.min.js"></script>
 </head>
 <body>
-    <h1>Счетчики на сайтах из топ-50 SimilarWeb</h1>
+    <h1>Счётчики на сайтах из топ-50 SimilarWeb</h1>
     <p id="result"></p>
     %= javascript begin
     var ws = new WebSocket('<%= url_for('answer')->to_abs %>');
     ws.onmessage = function (e) {
         var res = JSON.parse(e.data);
         if ( typeof res.data.YM !== 'undefined' ) {
-            $('#result').append(res.url + ' YM:' + res.data.YM + ' GA:' + res.data.GA + '<br />');
+            $('#result').append(res.url);
+            if ( res.data.YM == 1 ) 
+                $('#result').append(' есть <b>Яндекс Метрика</b>');
+            else if ( res.data.GA == 1 )
+                $('#result').append(' есть <b>Google Analytics</b>');
+            else if ( res.data.GA == 0 && res.data.YM == 0 )
+                $('#result').append(' счётчики не найдены');
+            $('#result').append('<br />');
         }
         else {
-            if ( typeof res.data.start !== 'undefined' ) {
-                console.log('start');
-            }
-            else {
-                $('#result').append(res.url + ' <b>error: ' + res.data + '</b><br />');
-            }
+            $('#result').append(res.url + ' <b>error: ' + res.data + '</b><br />');
         }
     };
     % end
